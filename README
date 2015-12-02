@@ -1,0 +1,6 @@
+This is a mirror of http://www.vim.org/scripts/script.php?script_id=5280
+
+If you are editing Tcl scripts for use with Synopsys tools, you will appreciate proper syntax highlighting for the command names as well as the command options. However, rather than providing a pre-compiled syntax file that will not match your installation of the Synopsys tools, this script can be used to generate them.
+
+The script is freely available on GitHub; see more info here:
+https://github.com/rolleric/snpsMan2VimSyntax

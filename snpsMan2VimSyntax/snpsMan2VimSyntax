@@ -1,0 +1,1163 @@
+#!/usr/bin/env perl
+
+my $versnum = "1.6.1";
+
+## DEVELOPMENT ONLY:
+## use diagnostics;            # force verbose warning diagnostics
+## use strict;                 # restrict unsafe constructs
+
+use Getopt::Long;           # GetOptions
+use File::Basename;         # fileparse, basename, dirname
+use File::stat;             # ->mtime
+use Pod::Usage;             # pod2usage
+
+
+
+# ---------------------------------------------------------------------------
+#   Defaults
+#
+# ---------------------------------------------------------------------------
+
+my $all_commands = 0;
+my $tcl_commands = 0;
+my $gui_commands = 0;
+my $comments = 0;
+my $old_tcl_vim = 0;
+my $outfile = "synopsys.vim";
+my @man_paths = ();
+my @tool_list = ();
+
+my $run_date = localtime();
+my $run_args = "$0 @ARGV";
+
+my %snps_tools = (
+        "dc_shell" => 0,    # New default is OFF
+        "icc_shell" => 0,
+        "pt_shell" => 0,
+        "fm_shell" => 0,
+);
+
+
+# ---------------------------------------------------------------------------
+#   Process command-line options
+#
+# ---------------------------------------------------------------------------
+
+my $show_help = 0;
+my $show_usage = 0;
+my $verbose = 0;
+my $versinfo = 0;
+my $vershow = 0;
+
+GetOptions( 'all'               => \$all_commands,
+            'comments!'         => \$comments,
+            'gui!'              => \$gui_commands,
+            'help|?'            => \$show_help,
+            'manpath=s'         => \@man_paths,
+            'old-tcl-vim'       => \$old_tcl_vim,
+            'output=s'          => \$outfile,
+            'tcl!'              => \$tcl_commands,
+            'tool=s'            => \@tool_list,
+            'usage'             => \$show_usage,
+            'verbose+'          => \$verbose,
+            'V'                 => \$vershow,
+            'version'           => \$versinfo ) or pod2usage(2);
+
+# Output response to -V or --version.
+print "$versnum\n" and exit 0 if $vershow;
+print "$0, Version $versnum (" . scalar(localtime(stat($0)->mtime)) . ")\n"
+        and exit 0 if $versinfo;
+
+# Output embedded podtext for --help or --usage.
+pod2usage(-verbose => 2) if ($show_help || $show_usage && $verbose);
+pod2usage(-verbose => 0) if $show_usage;
+
+# When no --tools given use "dc", "fm", and "pt".
+if (!@tool_list && !@man_paths) {
+    @tool_list = ( "dc", "fm", "pt" );
+}
+
+# Compose the executable names from the tool ids: dc -> dc_shell.
+foreach my $id ( @tool_list ) {
+    print "Enabling tool: ${id}_shell\n" if $verbose;
+    $snps_tools{"${id}_shell"} = 1;
+}
+
+undef @tool_list;
+
+# When --all commands, use all commands.
+$tcl_commands = $gui_commands = 1 if $all_commands;
+
+
+# ---------------------------------------------------------------------------
+#   Find the man pages
+#
+# ---------------------------------------------------------------------------
+
+print "Searching for man paths: " if $verbose;
+print "\n" if $verbose > 1;
+
+TOOL:
+# foreach tool ( "dc_shell" "fm_shell" "pt_shell" )
+foreach my $tool ( keys(%snps_tools) ) {
+
+    # Ignore disabled tools.
+    next TOOL unless $snps_tools{"$tool"};
+
+    # Get the path to the tool's executable file, e.g.
+    # path = "/var/tools/synopsys/dc-2015.06-SP1/bin/dc_shell"
+    my $path = qx/which $tool/;
+    chomp $path;
+
+    # If which failed, path would be "dc_shell: Command not found."
+    die "Executable for $tool not found\n" unless -x $path;
+
+    # Find the (glob pattern) paths to the man pages, e.g.
+    # path = "/var/tools/synopsys/dc-2015.06-SP1/doc/*/man"
+    $path =~ s|bin/$tool|doc/*/man|;
+
+    MAN:
+    # foreach dir ( ".../doc/{icc,snps_gui,snps_tcl,syn}/man" )
+    foreach my $dir ( glob("$path") ) {
+
+        # Optionally ignore the snps_gui/man pages as,
+        # ... well, who uses the GUI anyway?
+        unless ($gui_commands) {
+            if ($dir =~ m/snps_gui/) {
+                print "# $dir (IGNORED)\n" if $verbose > 1;
+                next MAN;
+            }
+        }
+
+        push (@man_paths, $dir);
+        print "- $dir\n" if $verbose > 1;
+    }
+}
+
+undef %snps_tools;
+
+print scalar(@man_paths) . "\n" if $verbose == 1;
+print "Number of paths: " . scalar(@man_paths) . "\n" if $verbose > 1;
+
+die "No man paths found\n" if (!@man_paths);
+
+
+# ---------------------------------------------------------------------------
+#   Collect Tcl command names to ignore
+#
+# ---------------------------------------------------------------------------
+
+# These are command names that we shall ignore, i.e. standard Tcl commands
+# which should be handled by the appropriate tcl.vim syntax file.
+my %ignore_command = (
+        "SEQGEN" => 1,
+        "change_selection" => !$gui_commands,
+        "change_selection_no_core" => !$gui_commands,
+        "change_selection_too_many_objects" => !$gui_commands,
+        "collections" => 1,
+        "get_cell" => 1,
+        "get_design" => 1,
+        "get_generated_clock" => 1,
+        "get_lib" => 1,
+        "get_lib_cell" => 1,
+        "get_lib_pin" => 1,
+        "get_net" => 1,
+        "get_path_group" => 1,
+        "get_pin" => 1,
+        "get_port" => 1,
+        "get_selection" => !$gui_commands,
+        "library" => 1,
+        "packagens" => 1,
+        "pkMkIndex" => 1,
+);
+
+# Don't ignore the gui commands if requested.
+foreach my $name ( keys(%ignore_command) ) {
+    delete $ignore_command{"$name"} unless $ignore_command{"$name"};
+}
+
+unless ($tcl_commands) {
+
+    print "Seaching for Tcl commands to igonore: " if $verbose;
+    print "\n" if $verbose > 1;
+
+    my $ignore_count = 0;
+
+    # Get the path for the Tcl shell.
+    my $path = qx/which tclsh/;
+    chomp $path;
+
+    die "tclsh not found\n" unless -x $path;
+
+    # Fins the path to the man pages.
+    $path =~ s|/bin/tclsh||;
+    foreach my $dir ( glob("$path/man $path/share/man") ) {
+        foreach my $file ( glob("$dir/mann/*.n $dir/mann/*.n.gz") ) {
+
+            # Get the command name from the file name.
+            my $name = basename($file, (".n", ".n.gz"));
+
+            # Add the name to the list of ignored commands.
+            $ignore_command{"$name"} = 1;
+            $ignore_count++;
+            print "- $name\n" if $verbose > 1;
+        }
+    }
+
+    print $ignore_count . "\n" if $verbose == 1;
+    print "Number of new ignored commands: " . $ignore_count . "\n" if $verbose > 1;
+
+    die "tclsh man pages not found; try 'man -w tclvars' to detect the mann path\n" unless $ignore_count;
+}
+
+
+# ---------------------------------------------------------------------------
+#   Collect the command names
+#
+# ---------------------------------------------------------------------------
+
+print "Searching for commands: " if $verbose;
+print "\n" if $verbose > 1;
+
+my %man_files = ();
+
+# Within all the man directories...
+foreach my $dir ( @man_paths ) {
+
+    # Look up the .../man/cat2/* files.
+    PAGE:
+    foreach my $file ( glob("$dir/cat2/*.2") ) {
+
+        # Get the command name from the file name.
+        # name = "write_file"
+        my $name = basename($file, ".2");
+
+        unless ($all_commands) {
+            # Ignore selected commands or known aliases.
+            if (defined($ignore_command{"$name"})) {
+                print "# $name (IGNORED)\n" if $verbose > 1;
+                next PAGE;
+            }
+
+            # Optionally, ignore GUI-related commands.
+            if (!$gui_commands && $name =~ m/^(gui|win)_/) {
+                print "# $name (IGNORED)\n" if $verbose > 1;
+                next PAGE;
+            }
+        }
+
+        # Store in a hash table: command name => colon-separated file names
+        # e.g man_files{"write_file"} = "path1/write_file.2:path2/write_file.2"
+        if (defined($man_files{"$name"})) {
+            $man_files{"$name"} .= ":$file";
+        } else {
+            $man_files{"$name"} = "$file";
+            print "- $name\n" if $verbose > 1;
+        }
+    }
+}
+
+undef @man_paths;
+undef %ignore_command;
+
+print scalar(keys(%man_files)) . "\n" if $verbose == 1;
+print "Number of man_files: " . scalar(keys(%man_files)) . "\n" if $verbose > 1;
+
+die "No commands found\n" if (!keys(%man_files));
+
+
+# ---------------------------------------------------------------------------
+#   Setup Abbreviations
+#
+# ---------------------------------------------------------------------------
+
+my %abbrev_options = (
+    "-application"          => "-app[lication]",
+    "-attribute"            => "-attr[ibute]",
+    "-attributes"           => "-attr[ibutes]",
+    "-attributes_only"      => "-attr[ibutes_only]",
+    "-crosstalk_delta"      => "-crosstalk[_delta]",
+    "-delay_type"           => "-delay[_type]",
+    "-dictionary"           => "-dict[ionary]",
+    "-endpoints_only"       => "-end[points_only]",
+    "-hierarchical"         => "-hier[archical]",
+    "-hierarchy"            => "-hier[archy]",
+    "-incremental"          => "-incr[emental]",
+    "-input_pins"           => "-input[_pins]",
+    "-max_paths"            => "-max_path[s]",
+    "-of_objects"           => "-of[_objects]",
+    "-path_type"            => "-path[_type]",
+    "-significant_digits"   => "-sig[nificant_digits]",
+    "-startpoints_only"     => "-start[points_only]",
+    "-temperature"          => "-temp[erature]",
+    "-transition_time"      => "-transition[_time]",
+    "-user_defined"         => "-user[_defined]",
+
+    # Forbidden abbreviations for these commands:
+    "create_qtm_delay_arc"      => 0,
+    "create_qtm_drive_type"     => 0,
+    "create_qtm_constraint_arc" => 0,
+    "create_qtm_load_type"      => 0,
+);
+
+sub abbrev_opt_name {
+    my ($cmd_name, $opt_name) = @_;
+
+    # No abbreviation if the command is on the no-can-do-list.
+    return $opt_name if defined($abbrev_options{"$cmd_name"});
+
+    # Where defined, try to abbreviate.
+    return $abbrev_options{"$opt_name"} if defined($abbrev_options{"$opt_name"});
+    return $opt_name;
+}
+
+
+# ---------------------------------------------------------------------------
+#   Setup groups, e.g. attributes.
+#
+# ---------------------------------------------------------------------------
+
+# Certain commands use additional command groups.
+# N.B. Commands with a "-filter" options will also be added.
+my %command_group = (
+    "filter"            => "snpsAttr,attString",
+    "filter_collection" => "snpsAttr,attString",
+    "get_attribute"     => "snpsAttr,attString",
+    "remove_attribute"  => "snpsAttr,attString",
+    "set_attribute"     => "snpsAttr,attString",
+    "sort_collection"   => "snpsAttr,attString",
+);
+
+# ---------------------------------------------------------------------------
+#   Reading the Manuals
+#
+# ---------------------------------------------------------------------------
+
+print "Parsing man pages:\n" if $verbose;
+
+my @simple_commands = ();
+my %commands_with_args = ();
+
+PARSE:
+# foreach name ( "read_verilog" "write_file" ... )
+foreach my $name ( sort(keys(%man_files)) ) {
+
+    print "+ $name\n" if $verbose;
+
+    my %errors_opts = ();
+    my %double_opts = ();  # $old_tcl_vim only
+    my %single_opts = ();
+    my $opt_count = 0;
+
+    # A command may have multiple man pages for multiple tools.
+    # foreach file ( "path1/write_file.2" "path2/write_file.2" )
+    foreach my $file ( split(/:/, $man_files{"$name"}) ) {
+
+        print "    $file\n" if $verbose > 1;
+
+        my $section = 0;
+        my $synopsis = "";
+
+        # Get the man page as a simple text file:
+        LINE:
+        foreach my $line ( split(/\n/, qx/man $file | col -bx/) ) {
+
+            if ($section == 1) {
+                # Parsing the "SYNTAX" section.
+
+                # Stop at the next "SECTION HEADER".
+                last LINE if $line =~ m/^[A-Z]{3}/;
+
+                # Do not use the SYNTAX section if the command
+                # name is mentioned together with options like
+                # this: "string the_command -option a_list".
+                if ($old_tcl_vim && $line =~ m/\b$name\s+[-\w]+/) {
+                    $section++;
+                    $synopsis = "";
+                    next LINE;
+                }
+
+                # Concatenate the command and options.
+                # Note that we use two spaces to separate.
+                $synopsis .= "  $line";
+
+            } elsif ($section == 3) {
+                # Parsing the "ARGUMENTS" section.
+
+                # Stop at the next "SECTION HEADER".
+                last LINE if $line =~ m/^[A-Z]{3}/;
+
+                if ($line =~ m/^\s{6,8}-\w+/) {
+
+                    # The first work after the option must
+                    # not begin with an uppercase letter.
+                    # If it did, remove the trailing text.
+                    # "-all Specifies that ..." -> "-all"
+                    $line =~ s/^(\s+-\w+)\s+[A-Z].*/$1/;
+
+                    # Note that we use two spaces to separate.
+                    $synopsis .= "  $line\n";
+                }
+
+            } elsif ($section == 2) {
+                # Wait for the "ARGUMENTS" line.
+                $section++ if $line =~ m/^ARGUMENTS/;
+
+            } else {
+                # Wait for the "SYNTAX" line.
+                $section++ if $line =~ m/^SYNTAX/;
+            }
+        }
+
+        if ($section == 1) {
+            # Fix hyphenations: "-quiet -applica- tion name"
+            # This fixes, for instance, "check_script -applica".
+            $synopsis =~ s/(\w+)- +(\w+)/$1$2/g;
+        }
+
+        # Special case, remove: "-opt obsolete_-_please_use_-_-arg".
+        # See, for instance, dc_shell's "set_driving_cell".
+            while ($synopsis =~ s/(-\w+) +obsolete[\w-]*//) {
+                my $opt_name = &abbrev_opt_name($name,$1);
+                $errors_opts{"$opt_name"} = 1;
+                $opt_count++;
+            }
+
+        # Detect the "-options with_arguments" or "-type { a | b }".
+        if ($old_tcl_vim) {
+            # There must be only a single space inbetween:
+            while ($synopsis =~ s/(-\w+) (\{|\w+)//) {
+                my $opt_name = &abbrev_opt_name($name,$1);
+                $double_opts{"$opt_name"} = 1;
+                $opt_count++;
+            }
+
+            # More spaces if enclosed in square braces: "[-a  b]"
+            while ($synopsis =~ s/\[(-\w+) +(\w+)\]//) {
+                my $opt_name = &abbrev_opt_name($name,$1);
+                $double_opts{"$opt_name"} = 1;
+                $opt_count++;
+            }
+        }
+
+            # Detect the "-single_options".
+            while ($synopsis =~ s/(-\w+)//) {
+                my $opt_name = &abbrev_opt_name($name,$1);
+                $single_opts{"$opt_name"} = 1;
+                $opt_count++;
+
+                # With the -filter option, we may like see attributes.
+                $command_group{"$name"} = "snpsAttr,attString" if $opt_name eq "-filter";
+            }
+    }
+
+    if ($opt_count) {
+
+        # Avoid duplication.
+        delete @single_opts{keys %errors_opts};
+
+        # To be able to detect commands with the same options, we compile the
+        # options into a coded string like "-quiet -strict // -bad // -1995 -type".
+        my $opt_code = join(" ",sort(keys(%single_opts)));
+
+        # Secondly, the obsolete options - if any.
+        $opt_code .= " // " . join(" ",sort(keys(%errors_opts)));
+
+        if ($old_tcl_vim) {
+            # Avoid parsing errors where single options were also detected to
+            # have arguments. We can't have it both ways.
+            delete @double_opts{keys %single_opts};
+            delete @double_opts{keys %errors_opts};
+
+            $opt_code .= " // " . join(" ",sort(keys(%double_opts)));
+        }
+
+        # Detecting commands with idential arguments is achieved simply
+        # by creating another hash table: opt_code => commands.
+        if (defined($commands_with_args{"$opt_code"})) {
+            $commands_with_args{"$opt_code"} .= " $name";
+        } else {
+            $commands_with_args{"$opt_code"} = $name;
+        }
+
+    } else {
+
+        # No options for this command.
+        push(@simple_commands, $name);
+    }
+}
+
+undef %abbrev_options;
+
+
+# ---------------------------------------------------------------------------
+#   Composing Syntax Commands
+#
+# ---------------------------------------------------------------------------
+
+print "Generating syntax file: $outfile\n" if $verbose;
+
+open(SYN, "> $outfile") or die "Can't open $outfile: $!, stopped";
+
+print "- header\n" if $verbose;
+
+my $us = basename($0);
+
+print SYN <<HEADER;
+" Vim syntax file
+" Language      TCL/TK with Synopsys keywords
+"
+" Autogenerated by $us (version $versnum) on $run_date
+" using $run_args
+
+set iskeyword=@,48-57,_,192-255,-
+
+HEADER
+
+if ($old_tcl_vim) {
+    print SYN <<OLD_VIM;
+" Beware: This script was designed to work with the old tcl.vim script
+"         (written by SM Smithfield), which is still available on vim.org.
+"         To work with the new tcl syntax definitions, re-run $us
+"         without the --old-tcl-vim option.
+
+OLD_VIM
+} else {
+    # Define the tclStff cluster similar to that in the old tcl.vim script.
+    print SYN "syn cluster tclStuff contains=tclLineContinue,tclNumber,tclVarRef,tclString,tcltkCommand,tclCommand,tclEmbeddedStatement\n\n";
+}
+
+
+# ---------------------------------------------------------------------------
+# Commands without arguments
+# ---------------------------------------------------------------------------
+
+print "- simple commands\n" if $verbose;
+
+my $command_type = $old_tcl_vim ? "snpsCmd" : "tclCommand";
+
+foreach my $name ( sort(@simple_commands) ) {
+
+    if ($comments) {
+        # Preceed the syntax definition with a comment of the source files.
+        foreach my $file ( split(/:/, $man_files{"$name"}) ) {
+            print SYN "\" $file\n";
+        }
+    }
+
+    # Simple commands have a single-line syntax declaration:
+    #
+    # syn keyword tclCommand current_design
+
+    print SYN "syn keyword $command_type $name\n";
+}
+
+undef @simple_commands;
+
+print SYN "\n";
+
+# ---------------------------------------------------------------------------
+# Commands with arguments.
+# ---------------------------------------------------------------------------
+
+print "- commands with arguments\n" if $verbose;
+
+my %used_codes = ();
+my %used_groups = ();
+my $footer_commands = "";
+
+# We use a comand color match group, not a region, in the new tcl.vim.
+$footer_commands = "hi def link snpxCol Statement\n" unless $old_tcl_vim;
+
+# This may seem counter-intuitive, but the order of the following commands
+# is not based on the command names, but on their arguments (by which they
+# have been grouped, remember?).
+foreach my $opt_code ( sort(keys(%commands_with_args)) ) {
+
+    my $command_list = $commands_with_args{"$opt_code"};
+    my %group_keys = ( "\@tclStuff" => 1 );
+
+    foreach my $name ( split(/ /,$command_list) ) {
+        # See whether any of the commands should include custom groups.
+        if (defined($command_group{"$name"})) {
+            foreach my $add_group ( split(/,/, $command_group{"$name"}) ) {
+
+                # The syntax contains= list needs to add this group.
+                $group_keys{"$add_group"} = 1;
+
+                # Remember that we need to add the definition for this group.
+                $used_groups{"$add_group"} = 1;
+            }
+        }
+
+        if ($comments) {
+            # Preceed the syntax definition with a comment of the source files.
+            foreach my $file ( split(/:/, $man_files{"$name"}) ) {
+                print SYN "\" $file\n";
+            }
+        }
+    }
+
+    # Generate an abbreviated code that will be somewhat predictable
+    # and will make it easier to diff the resulting synopsys.vim file.
+
+    # Convert the list of (already sorted) options into a short code:
+    my $code = $opt_code;               # -> "-quiet -str[ict] // -1995 -ty[pe]"
+    $code =~ s/ \/\///;                 # -> "-quiet -str[ict] -1995 -ty[pe]"
+    $code =~ s/\[\w+\]//g;              # -> "-quiet -str -1995 -ty"
+    $code =~ s/([a-z\d])\w+/$1/g;       # -> "-q -s -1 -t"
+    $code =~ s/[- ]//g;                 # -> "qs1t"
+    $code =~ s/(.)(.{0,2}).*/\U$1\E$2/; # -> "Qs1"
+
+    # If the code already exists, add a digit: "Qs1", "Qs10", "Qs11", ...
+    my $code_base = $code;
+    my $code_numr = 0;
+    while (defined($used_codes{"$code"})) {
+        $code = "$code_base$code_numr";
+        $code_numr++;
+    }
+
+    # Remember the code to be able to detect clashes.
+    $used_codes{"$code"} = 1;
+
+    my $region = "tcltkCommand";
+       $region = "snpsReg$code" if $old_tcl_vim;    # "snpsRegCel0"
+    my $group  = "snpsGrp$code";                    # "snpsGrpCel0"
+    my $switch = "snpsSwt$code";                    # "snpsSwtCel0"
+    my $swierr = "snpsSwx$code";                    # "snpsSwxCel0"
+
+    # Complex commands require region declarations.
+    if ($old_tcl_vim) {
+
+        # # Old tcl.vim example:
+        #
+        # syn keyword snpsCmd contained all_outputs skipwhite nextgroup=snpsRegCel0
+        # syn region snpsRegCel0 contained excludenl keepend start=+.+ skip=+\\$+ end=+}\|]\|;\|$+ contains=snpsGrpCel0,@tclStuff
+
+        print SYN "syn keyword $command_type contained " . $command_list . " skipwhite nextgroup=$region\n";
+        print SYN "syn region $region contained excludenl keepend start=+.+";
+
+    } else {
+
+        # # Pre-installed tcl.vim example:
+        #
+        # syn region tcltkCommand matchgroup=snpxCol start=+\<all_outputs\>+ matchgroup=NONE skip=+\\$+ end=+}\|]\|;\|$+ contains=snpsGrpCel0,@tclStuff
+
+        if ($command_list =~ s/ /\\|/g) {
+            $command_list = "\\(" . $command_list . "\\)";
+        }
+
+        print SYN "syn region $region matchgroup=snpxCol start=+\\<" . $command_list . "\\>+ matchgroup=NONE";
+    }
+
+    # Finish the syn region command line:
+    print SYN " skip=+\\\\\$+ end=+]\\|;\\|\$+me=e-1 contains=$group," . join(",",keys(%group_keys)) . "\n";
+
+    # # Options and arguments example:
+    #
+    # syn match snpsGrpCel0 contained "-\a\+" contains=snpsSwtCel0
+    # syn keyword snpsSwtCel0 contained -edge_triggered -level_sensitive
+    # syn match snpsGrpCel0 contained "-\a\+" contains=snpsSwtCel0
+    # syn keyword snpsSwtCel0 contained -clock
+
+    my ($single_opts, $errors_opts, $double_opts) = split(/ \/\/ /, $opt_code);
+
+    my $contains="$switch";
+    $contains .= ",$swierr" if (defined($errors_opts) && $errors_opts ne "");
+
+    print SYN "syn match $group contained \"-\\a\\+\" contains=$contains\n";
+
+    if ($single_opts ne "") {
+        print SYN "syn keyword $switch contained $single_opts\n";
+    }
+
+    # If there were obsolete options, add them to the snpsSwx* group:
+    if (defined($errors_opts) && $errors_opts ne "") {
+        print SYN "syn keyword $swierr contained $errors_opts\n";
+
+        $footer_commands .= "hi def link $swierr Error\n";
+    }
+
+    # $old_tcl_vim only: options with arguments.
+    if (defined($double_opts) && $double_opts ne "") {
+        print SYN "syn match $group contained \"-\\a\\+\" contains=$switch\n";
+        print SYN "syn keyword $switch contained $double_opts\n";
+    }
+
+    # # Assemble the commands that we will add to the end:
+    #
+    # hi def link snpsSwxCel0 Error
+    # hi def link snpsSwtCel0 Special
+
+    $footer_commands .= "hi def link $switch Special\n";
+
+    print SYN "\n";
+}
+
+undef %commands_with_args;
+undef %man_files;
+undef %used_codes;
+
+
+# ---------------------------------------------------------------------------
+# Additional groups
+# ---------------------------------------------------------------------------
+
+if (defined($used_groups{"snpsAttr"})) {
+
+    print "- attributes\n" if $verbose;
+
+    # All the attributes that we care about.
+    # This is a bit ugly but easy to maintain:
+    my @attributes = (
+        "actual_max_net_capacitance",
+        "actual_min_net_capacitance",
+        "arrival",
+        "async_set_reset_q async_set_reset_qn",
+        "balance_registers",
+        "bbox",
+        "boundary_optimization",
+        "capture_clock_paths",
+        "case_value",
+        "clock_fall_transition",
+        "clock_gate_fanout",
+        "clock_gate_has_observation",
+        "clock_gate_has_postcontrol",
+        "clock_gate_has_precontrol",
+        "clock_gate_level",
+        "clock_gate_module_fanout",
+        "clock_gate_multi_stage_fanout",
+        "clock_gate_register_fanout",
+        "clock_gate_transitive_register_fanout",
+        "clock_gating_depth",
+        "clock_path",
+        "clock_rise_transition",
+        "clock_uncertainty",
+        "clocks",
+        "combinational_type_exact",
+        "connection_class",
+        "count",
+        "crpr_common_point",
+        "crpr_value",
+        "default_flip_flop_type",
+        "default_flip_flop_type_exact",
+        "default_latch_type_exact",
+        "delay_max_fall",
+        "delay_max_rise",
+        "delay_min_fall",
+        "delay_min_rise",
+        "design_type",
+        "direction",
+        "disable_timing",
+        "dont_touch",
+        "dont_touch_network",
+        "dont_use",
+        "driven_by_dont_care",
+        "driven_by_logic_one",
+        "driven_by_logic_zero",
+        "driving_cell_dont_scale",
+        "driving_cell_fall",
+        "driving_cell_from_pin_fall",
+        "driving_cell_from_pin_rise",
+        "driving_cell_library_fall",
+        "driving_cell_library_rise",
+        "driving_cell_multiply_by",
+        "driving_cell_pin_fall",
+        "driving_cell_pin_rise",
+        "driving_cell_rise",
+        "endpoint",
+        "endpoint_clock",
+        "endpoint_clock_close_edge_type",
+        "endpoint_clock_close_edge_value",
+        "endpoint_clock_is_inverted",
+        "endpoint_clock_is_propagated",
+        "endpoint_clock_latency",
+        "endpoint_clock_open_edge_type",
+        "endpoint_clock_open_edge_value",
+        "endpoint_clock_pin",
+        "endpoint_hold_time_value",
+        "endpoint_is_level_sensitive",
+        "endpoint_output_delay_value",
+        "endpoint_recovery_time_value",
+        "endpoint_removal_time_value",
+        "endpoint_setup_time_value",
+        "fall_drive",
+        "fanout_load",
+        "fix_hold",
+        "flatten",
+        "flatten_effort",
+        "flatten_minimize",
+        "flatten_phase",
+        "flip_flop_type",
+        "flip_flop_type_exact",
+        "formula",
+        "from_pin",
+        "full_name",
+        "hierarchical",
+        "hold_uncertainty",
+        "implementation",
+        "is_annotated_fall_max",
+        "is_annotated_fall_min",
+        "is_annotated_rise_max",
+        "is_annotated_rise_min",
+        "is_async_pin",
+        "is_black_box",
+        "is_cellarc",
+        "is_clock_gate",
+        "is_clock_gate_clock_pin",
+        "is_clock_gate_enable_pin",
+        "is_clock_gate_observation_pin",
+        "is_clock_gate_output_pin",
+        "is_clock_gate_test_pin",
+        "is_clock_gated",
+        "is_clock_gating_design",
+        "is_clock_gating_observability_design",
+        "is_clock_pin",
+        "is_combinational",
+        "is_data_pin",
+        "is_disabled",
+        "is_dw_subblock",
+        "is_generated",
+        "is_gicg",
+        "is_hierarchical",
+        "is_icg",
+        "is_isolated_operator",
+        "is_latch_based_clock_gate",
+        "is_latch_free_clock_gate",
+        "is_mapped",
+        "is_negative_edge_clock_gate",
+        "is_negative_level_sensitive",
+        "is_operand_isolation_control_pin",
+        "is_operand_isolation_data_pin",
+        "is_operand_isolation_output_pin",
+        "is_operand_isolator",
+        "is_positive_edge_clock_gate",
+        "is_positive_level_sensitive",
+        "is_sequential",
+        "is_synlib_module",
+        "is_synlib_operator",
+        "is_test_circuitry",
+        "is_unmapped",
+        "is_user_disabled",
+        "latch_type_exact",
+        "launch_clock_paths",
+        "layer",
+        "lib_pin_name",
+        "load",
+        "local_link_library",
+        "map_only",
+        "max_area",
+        "max_capacitance",
+        "max_dynamic_power",
+        "max_fall_delay",
+        "max_fall_slack",
+        "max_fanout",
+        "max_leakage_power",
+        "max_rise_delay",
+        "max_rise_slack",
+        "max_slack",
+        "max_time_borrow",
+        "max_total_power",
+        "max_transition",
+        "min_capacitance",
+        "min_fall_delay",
+        "min_fall_slack",
+        "min_rise_delay",
+        "min_rise_slack",
+        "min_slack",
+        "minimize_tree_delay",
+        "mode",
+        "model_drive",
+        "model_load",
+        "model_map_effort",
+        "model_scale",
+        "name",
+        "no_sequential_degenerates",
+        "object",
+        "object_class",
+        "observe_pin",
+        "operand_isolation_style",
+        "optimize_registers",
+        "path_group",
+        "path_type",
+        "period",
+        "pin_direction",
+        "pin_properties",
+        "points",
+        "port_direction",
+        "port_is_pad",
+        "preferred",
+        "propagated_clock",
+        "ref_name",
+        "register_list",
+        "resource_allocation",
+        "resource_implementation",
+        "rise_fall",
+        "scan",
+        "scan_chain",
+        "scan_element",
+        "scan_group",
+        "scan_latch_transparent",
+        "scenario",
+        "sdf_cond",
+        "sense",
+        "sequential_bridging",
+        "set_id",
+        "set_pin",
+        "setup_uncertainty",
+        "share_cse",
+        "signal_type",
+        "slack",
+        "sources",
+        "space",
+        "start",
+        "startpoint",
+        "startpoint_clock",
+        "startpoint_clock_is_inverted",
+        "startpoint_clock_is_propagated",
+        "startpoint_clock_latency",
+        "startpoint_clock_open_edge_type",
+        "startpoint_clock_open_edge_value",
+        "startpoint_input_delay_value",
+        "startpoint_is_level_sensitive",
+        "static_probability",
+        "stop",
+        "structure",
+        "structure_boolean",
+        "structure_timing",
+        "test_assume",
+        "test_initial",
+        "test_isolate",
+        "test_routing_position",
+        "time_borrowed_from_endpoint",
+        "time_lent_to_startpoint",
+        "to_pin",
+        "toggle_rate",
+        "true_delay_case_analysis",
+        "ungroup",
+        "wire_load_model_mode",
+        "wired_logic_disable",
+        "xnfout_use_blknames",
+    );
+
+    my $prefix = "syn keyword snpsAttr contained";
+    my $line = $prefix;
+
+    for my $name ( sort(@attributes) ) {
+        if (length($line) > 80) {
+            print SYN "$line\n";
+            $line = $prefix;
+        }
+        $line .= " $name";
+    }
+
+    print SYN "$line\n\n";
+
+    $footer_commands .= "hi def link snpsAttr Define\n";
+}
+
+if (defined($used_groups{"attString"})) {
+
+    print SYN "\" To highlight attribute names within strings:\n";
+    if ($old_tcl_vim) {
+        # Based on the tclQuotes region:
+        print SYN "syn region attString contained start=+\\(\\\\\\)\\\@<!\"+ end=+\"+ skip=+\\(\\\\\\)\\\@<!\\\\\"\\|\\(\\\\\\\\\\\\\\)\\\@<!\\\\\"\\|\\\\\\\\+ contains=\@tclQuotesCluster,snpsAttr\n\n";
+    } else {
+        # Based on the tclString region:
+        print SYN "syn region attString contained start=+[^\\\\]\"+ end=+\"+ skip=+\\\\\\\\\\|\\\\\"+ contains=\@tclSpecialC,\@tclVarRefC,snpsAttr,tclEmbeddedStatement\n\n";
+    }
+
+    $footer_commands .= "hi def link attString String\n";
+}
+
+undef %used_groups;
+
+
+# ---------------------------------------------------------------------------
+# Highlighting
+# ---------------------------------------------------------------------------
+print "- footer\n" if $verbose;
+
+print SYN $footer_commands;
+
+print SYN "hi def link $command_type Statement\n" if $old_tcl_vim;
+
+close(SYN);
+
+
+
+# ---------------------------------------------------------------------------
+#   Embedded Usage
+#
+# ---------------------------------------------------------------------------
+
+__END__
+
+=head1 NAME
+
+snpsMan2VimSyntax - create vim syntax files from Synopsys man pages.
+
+=head1 SYNOPSIS
+
+snpsMan2VimSyntax [options]
+
+    Options:
+        --all               Do not hide known duplicate/GUI commands.
+        --(no)comments      Adds man file page comments (default: off).
+        --help|-?           Shows this help message.
+        --manpath /p/man    Defines the path of the man directory.
+        --output name.vim   Define the output file (default synopsys.vim).
+        --tool id           Will enable handling "<id>_shell" commands.
+        --usage             Shows just the synopsis of the help message.
+        --verbose           Shows more progress or help messages.
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--all> | B<--(no)tcl> | B<--(no)gui>
+
+With the B<--all> option, syntax definitions are generated for all commands.
+The default is to hide standard Tcl commands (B<--notcl>) and GUI commands
+(B<--nogui>).
+
+=item B<--(no)comments>
+
+Can be used to enable or disable the generation of comments in the output
+file. The default is off, i.e. B<--nocomments>. When on, each syntax
+definition for a command will be preceeded with a comment that is listing
+the man source files upon which the definition was based.
+
+=item B<--help> | B<-?>
+
+Shows the help message or with B<--verbose> the entire manual page.
+
+=item B<--manpath>
+
+Use can this option (when the standard approch via B<--tool> fails) to
+specify the location of a F<man> path. For multiple paths, feel free to
+use this option multiple times.
+
+=item B<--old-tcl-vim>
+
+Use this option if you are using the old F<tcl.vim> syntax definitions,
+i.e. those written by SM Smithfield.
+
+=item B<--output> file
+
+Sets the name of the output file to generate. The default name is
+"synopsys.vim".
+
+=item B<--tool> id
+
+Adds <id>_shell to the list of tools to search. You can use this option
+multiple times for multiple tools, see example below. Defaults to C<dc>,
+C<fm>, and C<pt> (unless B<--manpath> was used).
+
+=item B<--usage>
+
+Shows the usage information for this command, i.e. the just the SYNOPSIS
+section.
+
+=item B<--verbose>
+
+Shows progress messages or additional help texts. Even more progress and
+debug messsages are produced if you use this option twice.
+
+=item B<-V> | B<--version>
+
+Shows the version number or the verbose version information for
+this script.
+
+=back
+
+=head1 DESCRIPTION
+
+B<snpsMan2VimSyntax> parses the manual pages for synopsys tool commands and
+generates VIM syntax files for the commands and their arguments.
+
+For each tool <id>, it looks up the installation path for a <id>_shell,
+and searches for the manual pages in the installation tree. Only man2
+pages, i.e. tool-internal commands are scanned. Each of the commands is
+parsed and a single VIM syntax definition file is generated.
+
+The generated syntax file has two sections. In the first section,
+simple commands (those without arguments) are listed as:
+
+    syn keyword tclCommand example_set_command
+
+In the second section we output syntax regions for commands with
+arguments:
+
+    syn region tcltkCommand matchgroup=snpxCol start=+\<example_write_command\>+ matchgroup=NONE skip=+\\$+ end=+}\|]\|;\|$+ contains=snpsGrpOv,@tclStuff
+    syn match snpsGrpOv contained "-\a\+" contains=snpsSwOv
+    syn keyword snpsSwtOv contained -verbose
+    syn match snpsGrpOv contained "-\a\+" contains=snpsSwtOv
+    syn keyword snpsSwtOv contained -output
+
+The color options assigned to the commands and options are:
+
+    hi def link snpxCol Statement
+    hi def link snpsSwtOv Special
+
+NB. See B<--old-tcl-vim> regarding C<tclStuff> if you are using an old version
+of the F<tcl.vim> syntax script.
+
+
+=head1 INSTALL
+
+Vim usually comes with F<tcl.vim> (1) pre-installed. If it were missing,
+or if you wanted to use a different version, you can add it to your local
+F<.vim> configuration directory:
+
+    ~/.vim/syntax/tcl.vim (2)
+
+NB. If the above were an old tcl.vim script (which defines \@tclStuff),
+you should add the B<--old-tcl-vim> option when you run snpsMan2VimSyntax.
+
+To install the generated syntax file, place it here:
+
+    ~/.vim/syntax/synopsys.tcl (S)
+
+Next add an additional F<tcl.vim> that is read I<after> the standard Tcl
+syntax file:
+
+    ~/.vim/after/syntax/tcl.vim (A)
+
+Within that file, you can define your own syntax definitions. Add the
+following line to include the F<synopsys.vim> file:
+
+    " Add the synopsys.vim file to the Tcl syntax.
+    source ~/.vim/syntax/synopsys.vim
+
+Done.
+
+From now on, whenever you edit a Tcl source file in Vim with C<syntax=tcl>
+and C<syntax on>, Vim will read (1) or if present (2), then (A) which loads
+(S).
+
+
+=head1 EXAMPLE
+
+snpsMan2VimSyntax --tool dc --tool icc --comments --out implementation.vim --verbose
+
+=head1 REQUIREMENTS
+
+Obviously, the corresponding Synopsys tools need to be installed to be able
+to access their manual pages. B<man> is used to parse the pages, B<col> to
+ignore tabs and colour codes. To be able to ignore standard Tcl commands, a
+stand-alone version of Tcl needs to be installed (the script searches for
+B<tclsh>).
+
+
+=head1 SEE ALSO
+
+L<Vim.org|http://www.vim.org/>
+L<Vim.org/scripts|http://www.vim.org/scripts/script_search_results.php?keywords=tcl&script_type=syntax&order_by=downloads&direction=descending&search=search>
+
+=head1 AUTHOR
+
+Eric Roller
+
+=cut
+
